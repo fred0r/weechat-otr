@@ -107,7 +107,7 @@ This script supports only OTR protocol version 2.
 
 SCRIPT_AUTHOR = 'Matthew M. Boedicker'
 SCRIPT_LICENCE = 'GPL3'
-SCRIPT_VERSION = '1.9.2'
+SCRIPT_VERSION = '1.9.2-slop'
 
 OTR_DIR_NAME = 'otr'
 
