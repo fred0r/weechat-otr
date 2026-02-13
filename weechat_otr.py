@@ -80,6 +80,34 @@ except (ImportError, AttributeError):
     # If pycrypto or older pycryptodome is used, no patch needed
     pass
 
+# Additional compatibility patch for AES CTR mode in pycryptodome 3.18+
+# potr uses old pycrypto Counter objects which are incompatible with pycryptodome
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util import Counter
+
+    _original_aes_new = AES.new
+
+    def _patched_aes_new(key, mode, *args, **kwargs):
+        # Convert old-style Counter object to new format for pycryptodome 3.18+
+        if mode == AES.MODE_CTR and 'counter' in kwargs:
+            counter_obj = kwargs['counter']
+            # Check if it's an old-style Counter object
+            if hasattr(counter_obj, '_counter') and hasattr(counter_obj, '_width'):
+                # Convert to new counter format (dict with 'nonce' and 'initial_value')
+                try:
+                    initial_value = counter_obj._counter[0] if counter_obj._counter else 0
+                    kwargs['counter'] = Counter.new(counter_obj._width, initial_value=initial_value)
+                except (AttributeError, IndexError):
+                    pass
+        return _original_aes_new(key, mode, *args, **kwargs)
+
+    AES.new = staticmethod(_patched_aes_new)
+
+except (ImportError, AttributeError):
+    # If incompatible version, skip patch
+    pass
+
 SCRIPT_NAME = 'otr'
 SCRIPT_DESC = 'Off-the-Record messaging for IRC'
 SCRIPT_HELP = """{description}
