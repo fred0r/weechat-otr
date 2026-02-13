@@ -41,6 +41,28 @@ import shutil
 import sys
 import traceback
 
+# Compatibility patch for pycryptodome 3.18+ with potr (BEFORE potr import)
+# potr uses old pycrypto API with Counter objects.
+# pycryptodome's AES.new() doesn't accept old-style Counters.
+# We patch AESCTR to use pycryptodome's nonce-based CTR mode instead.
+try:
+    import potr.compatcrypto.pycrypto as potr_pycrypto
+    from Crypto.Cipher import AES
+
+    _original_AESCTR = potr_pycrypto.AESCTR
+
+    def _patched_AESCTR(key, iv=None):
+        """
+        Patched AESCTR that uses pycryptodome's nonce-based CTR mode.
+        This avoids the incompatibility with old pycrypto Counter objects.
+        nonce=b'' means counter starts at 0, equivalent to Counter.new(128, initial_value=0).
+        """
+        return AES.new(key, AES.MODE_CTR, nonce=b'')
+
+    potr_pycrypto.AESCTR = _patched_AESCTR
+except (ImportError, AttributeError):
+    pass
+
 import potr
 import weechat
 
@@ -80,38 +102,27 @@ except (ImportError, AttributeError):
     # If pycrypto or older pycryptodome is used, no patch needed
     pass
 
-# Compatibility patch for pycryptodome 3.18+ with potr
-# Patch BEFORE importing potr by modifying Cipher module
-try:
-    from Crypto import Cipher
-    from Crypto.Cipher import AES
-    from Crypto.Util import Counter
-    import struct
+# Python 3 compatibility shim for tests that still use PYVER
+# (Tests were reverted to original state and still reference PYVER)
+class _Pyver:
+    """Minimal PYVER shim for backward compatibility with tests"""
+    @staticmethod
+    def to_str(s):
+        return s if isinstance(s, str) else str(s)
 
-    _original_aes_new = AES.new
+    @staticmethod
+    def to_unicode(s):
+        return s if isinstance(s, str) else str(s)
 
-    def _patched_aes_new(key, mode, *args, **kwargs):
-        """Patch AES.new to handle old pycrypto Counter objects"""
-        # Handle CTR mode with old Counter objects
-        if mode == AES.MODE_CTR and 'counter' in kwargs:
-            counter_obj = kwargs['counter']
-            # Detect old-style pycrypto Counter by class name
-            if hasattr(counter_obj, '__class__') and 'Counter' in counter_obj.__class__.__name__:
-                if hasattr(counter_obj, '_counter'):
-                    # Replace old Counter with new one compatible with pycryptodome
-                    try:
-                        kwargs['counter'] = Counter.new(128)
-                    except Exception:
-                        pass
-        return _original_aes_new(key, mode, *args, **kwargs)
+    @staticmethod
+    def unicode(s):
+        return str(s)
 
-    # Patch at Cipher module level (what potr uses)
-    AES.new = _patched_aes_new
-    # Also patch via Cipher module namespace
-    Cipher.AES.new = _patched_aes_new
+    @staticmethod
+    def unichr(code):
+        return chr(code)
 
-except (ImportError, AttributeError):
-    pass
+PYVER = _Pyver()
 
 SCRIPT_NAME = 'otr'
 SCRIPT_DESC = 'Off-the-Record messaging for IRC'
@@ -411,7 +422,7 @@ def msg_irc_from_plain(msg):
     """Transform a plain-text message to irc format.
     This will replace lines that start with /me with the respective
     irc command."""
-    return PLAIN_ACTION_RE.sub(r'\x01ACTION \g<text>\x01', msg)
+    return PLAIN_ACTION_RE.sub('\x01ACTION \\g<text>\x01', msg)
 
 def msg_plain_from_irc(msg):
     """Transform an irc message to plain-text.
