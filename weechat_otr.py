@@ -93,19 +93,43 @@ try:
         if mode == AES.MODE_CTR and 'counter' in kwargs:
             counter_obj = kwargs['counter']
             # Check if it's an old-style Counter object
-            if hasattr(counter_obj, '_counter') and hasattr(counter_obj, '_width'):
-                # Convert to new counter format (dict with 'nonce' and 'initial_value')
+            if hasattr(counter_obj, '__class__') and 'Counter' in counter_obj.__class__.__name__:
                 try:
-                    initial_value = counter_obj._counter[0] if counter_obj._counter else 0
-                    kwargs['counter'] = Counter.new(counter_obj._width, initial_value=initial_value)
-                except (AttributeError, IndexError):
+                    # For old pycrypto Counter, extract initial value and recreate
+                    if hasattr(counter_obj, '_counter') and isinstance(counter_obj._counter, (list, tuple)):
+                        initial = int(counter_obj._counter[0]) if counter_obj._counter else 0
+                        width = getattr(counter_obj, '_width', 128)
+                        # Use nonce-based initialization instead
+                        import struct
+                        nonce_bytes = struct.pack('>Q', initial >> 64) if width == 128 else b''
+                        kwargs.pop('counter')
+                        kwargs['nonce'] = nonce_bytes
+                except Exception:
                     pass
         return _original_aes_new(key, mode, *args, **kwargs)
 
-    AES.new = staticmethod(_patched_aes_new)
+    AES.new = _patched_aes_new
 
 except (ImportError, AttributeError):
-    # If incompatible version, skip patch
+    pass
+
+# Direct patch for potr's AESCTR function for pycryptodome 3.18+ compatibility
+try:
+    import potr.compatcrypto.pycrypto as potr_pycrypto
+    from Crypto.Cipher import AES
+    from Crypto.Util import Counter
+
+    _original_aesctr = potr_pycrypto.AESCTR
+
+    def _patched_aesctr(key):
+        """Create AES CTR cipher compatible with pycryptodome 3.18+"""
+        # Create a new counter with proper initialization for pycryptodome
+        counter = Counter.new(128)
+        return AES.new(key, AES.MODE_CTR, counter=counter)
+
+    potr_pycrypto.AESCTR = _patched_aesctr
+
+except (ImportError, AttributeError):
     pass
 
 SCRIPT_NAME = 'otr'
