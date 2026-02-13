@@ -1,1 +1,2 @@
 python-potr
+pycryptodome>=3.23

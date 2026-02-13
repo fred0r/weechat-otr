@@ -44,6 +44,32 @@ import traceback
 import potr
 import weechat
 
+# Compatibility patch for pycryptodome 3.18+ with potr
+# pycryptodome 3.18+ changed DSA key structure; potr expects old API
+try:
+    from Crypto.PublicKey import DSA
+
+    # Patch DSA key objects to support old attribute access API
+    _original_dsa_getattr = DSA.DsaKey.__getattribute__
+
+    def _patched_dsa_getattr(self, name):
+        # Handle old-style key component access (key.y, key.g, key.p, key.q)
+        if name in ('y', 'g', 'p', 'q', 'x'):
+            try:
+                # Try to access the internal _key dict
+                key_dict = _original_dsa_getattr(self, '_key')
+                if isinstance(key_dict, dict) and name in key_dict:
+                    return key_dict[name]
+            except (AttributeError, KeyError):
+                pass
+        # Fall back to normal attribute access
+        return _original_dsa_getattr(self, name)
+
+    DSA.DsaKey.__getattribute__ = _patched_dsa_getattr
+except (ImportError, AttributeError):
+    # If pycrypto or older pycryptodome is used, no patch needed
+    pass
+
 SCRIPT_NAME = 'otr'
 SCRIPT_DESC = 'Off-the-Record messaging for IRC'
 SCRIPT_HELP = """{description}
