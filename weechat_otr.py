@@ -80,54 +80,35 @@ except (ImportError, AttributeError):
     # If pycrypto or older pycryptodome is used, no patch needed
     pass
 
-# Additional compatibility patch for AES CTR mode in pycryptodome 3.18+
-# potr uses old pycrypto Counter objects which are incompatible with pycryptodome
+# Compatibility patch for pycryptodome 3.18+ with potr
+# Patch BEFORE importing potr by modifying Cipher module
 try:
+    from Crypto import Cipher
     from Crypto.Cipher import AES
     from Crypto.Util import Counter
+    import struct
 
     _original_aes_new = AES.new
 
     def _patched_aes_new(key, mode, *args, **kwargs):
-        # Convert old-style Counter object to new format for pycryptodome 3.18+
+        """Patch AES.new to handle old pycrypto Counter objects"""
+        # Handle CTR mode with old Counter objects
         if mode == AES.MODE_CTR and 'counter' in kwargs:
             counter_obj = kwargs['counter']
-            # Check if it's an old-style Counter object
+            # Detect old-style pycrypto Counter by class name
             if hasattr(counter_obj, '__class__') and 'Counter' in counter_obj.__class__.__name__:
-                try:
-                    # For old pycrypto Counter, extract initial value and recreate
-                    if hasattr(counter_obj, '_counter') and isinstance(counter_obj._counter, (list, tuple)):
-                        initial = int(counter_obj._counter[0]) if counter_obj._counter else 0
-                        width = getattr(counter_obj, '_width', 128)
-                        # Use nonce-based initialization instead
-                        import struct
-                        nonce_bytes = struct.pack('>Q', initial >> 64) if width == 128 else b''
-                        kwargs.pop('counter')
-                        kwargs['nonce'] = nonce_bytes
-                except Exception:
-                    pass
+                if hasattr(counter_obj, '_counter'):
+                    # Replace old Counter with new one compatible with pycryptodome
+                    try:
+                        kwargs['counter'] = Counter.new(128)
+                    except Exception:
+                        pass
         return _original_aes_new(key, mode, *args, **kwargs)
 
+    # Patch at Cipher module level (what potr uses)
     AES.new = _patched_aes_new
-
-except (ImportError, AttributeError):
-    pass
-
-# Direct patch for potr's AESCTR function for pycryptodome 3.18+ compatibility
-try:
-    import potr.compatcrypto.pycrypto as potr_pycrypto
-    from Crypto.Cipher import AES
-    from Crypto.Util import Counter
-
-    _original_aesctr = potr_pycrypto.AESCTR
-
-    def _patched_aesctr(key):
-        """Create AES CTR cipher compatible with pycryptodome 3.18+"""
-        # Create a new counter with proper initialization for pycryptodome
-        counter = Counter.new(128)
-        return AES.new(key, AES.MODE_CTR, counter=counter)
-
-    potr_pycrypto.AESCTR = _patched_aesctr
+    # Also patch via Cipher module namespace
+    Cipher.AES.new = _patched_aes_new
 
 except (ImportError, AttributeError):
     pass
