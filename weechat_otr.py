@@ -398,7 +398,7 @@ def colorize(msg, color):
             color=colorstr,
             msg=line))
 
-    return '\r\n'.join(result)
+    return '\n'.join(result)
 
 def accounts():
     """Return a list of all IrcOtrAccounts sorted by name."""
