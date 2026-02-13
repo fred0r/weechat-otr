@@ -342,7 +342,7 @@ def msg_irc_from_plain(msg):
     """Transform a plain-text message to irc format.
     This will replace lines that start with /me with the respective
     irc command."""
-    return PLAIN_ACTION_RE.sub('\x01ACTION \g<text>\x01', msg)
+    return PLAIN_ACTION_RE.sub(r'\x01ACTION \g<text>\x01', msg)
 
 def msg_plain_from_irc(msg):
     """Transform an irc message to plain-text.
@@ -1739,7 +1739,7 @@ def init_config():
              'string',
              'do not OTR whitespace tag messages to nicks matching this regex '
              '(case insensitive)',
-             '^(alis|chanfix|global|.+serv|\*.+)$'),
+             r'^(alis|chanfix|global|.+serv|\*.+)$'),
         ]:
         weechat.config_new_option(
             CONFIG_FILE, CONFIG_SECTIONS['general'], option, typ, desc, '', 0,
