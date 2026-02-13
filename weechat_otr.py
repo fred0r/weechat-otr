@@ -49,23 +49,33 @@ import weechat
 try:
     from Crypto.PublicKey import DSA
 
-    # Patch DSA key objects to support old attribute access API
-    _original_dsa_getattr = DSA.DsaKey.__getattribute__
+    # Create a wrapper class that provides the old .key interface
+    class _LegacyKeyWrapper:
+        """Wraps DSA key components for backward compatibility with potr"""
+        def __init__(self, dsa_key):
+            self.y = dsa_key.y
+            self.g = dsa_key.g
+            self.p = dsa_key.p
+            self.q = dsa_key.q
+            if hasattr(dsa_key, 'x'):
+                self.x = dsa_key.x
 
-    def _patched_dsa_getattr(self, name):
-        # Handle old-style key component access (key.y, key.g, key.p, key.q)
-        if name in ('y', 'g', 'p', 'q', 'x'):
-            try:
-                # Try to access the internal _key dict
-                key_dict = _original_dsa_getattr(self, '_key')
-                if isinstance(key_dict, dict) and name in key_dict:
-                    return key_dict[name]
-            except (AttributeError, KeyError):
-                pass
-        # Fall back to normal attribute access
-        return _original_dsa_getattr(self, name)
+    # Patch DSA key objects to support old .key attribute access
+    _original_dsa_init = DSA.DsaKey.__init__
 
-    DSA.DsaKey.__getattribute__ = _patched_dsa_getattr
+    def _patched_dsa_init(self, *args, **kwargs):
+        _original_dsa_init(self, *args, **kwargs)
+        # Add .key property that returns legacy wrapper
+        self._legacy_key = None
+
+    def _get_legacy_key(self):
+        if self._legacy_key is None:
+            self._legacy_key = _LegacyKeyWrapper(self)
+        return self._legacy_key
+
+    DSA.DsaKey.__init__ = _patched_dsa_init
+    DSA.DsaKey.key = property(_get_legacy_key)
+
 except (ImportError, AttributeError):
     # If pycrypto or older pycryptodome is used, no patch needed
     pass
