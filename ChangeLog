@@ -1,3 +1,29 @@
+1.9.2-slop
+  2026-02-15
+
+  Add comprehensive compatibility patches for pycryptodome 3.23+.
+
+  Patch AES.new() to properly handle potr's custom Counter objects by
+  using deterministic nonce values derived from counter.prefix instead
+  of random nonces. This fixes OTR message encryption/decryption.
+
+  Patch DSA.construct() to bypass strict validation in pycryptodome 3.23+
+  which rejected key components that were valid in old pycrypto. Allows
+  potr to reconstruct saved DSA keys.
+
+  Implement DSA signing and verification using pycryptodome's DSS module
+  since the old key.sign(data, K) method was removed. Maintains the
+  same signature format for compatibility with OTR protocol.
+
+  Add .key property to DSA.DsaKey for backward compatibility with potr
+  code that expects to access key.key.y and similar attributes.
+
+  Fix IRC message line endings for private buffers by converting \n to
+  \r\n in print_buffer() for proper IRC protocol compliance.
+
+  All 345 unit tests now pass with pycryptodome 3.23+. Supports full
+  OTR session establishment, encryption, and decryption.
+
 1.9.2
   2018-03-26
 

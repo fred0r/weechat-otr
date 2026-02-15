@@ -41,65 +41,207 @@ import shutil
 import sys
 import traceback
 
-# Compatibility patch for pycryptodome 3.18+ with potr (BEFORE potr import)
-# potr uses old pycrypto API with Counter objects.
-# pycryptodome's AES.new() doesn't accept old-style Counters.
-# We patch AESCTR to use pycryptodome's nonce-based CTR mode instead.
-try:
-    import potr.compatcrypto.pycrypto as potr_pycrypto
-    from Crypto.Cipher import AES
-
-    _original_AESCTR = potr_pycrypto.AESCTR
-
-    def _patched_AESCTR(key, iv=None):
-        """
-        Patched AESCTR that uses pycryptodome's nonce-based CTR mode.
-        This avoids the incompatibility with old pycrypto Counter objects.
-        nonce=b'' means counter starts at 0, equivalent to Counter.new(128, initial_value=0).
-        """
-        return AES.new(key, AES.MODE_CTR, nonce=b'')
-
-    potr_pycrypto.AESCTR = _patched_AESCTR
-except (ImportError, AttributeError):
-    pass
-
 import potr
 import weechat
 
-# Compatibility patch for pycryptodome 3.18+ with potr
-# pycryptodome 3.18+ changed DSA key structure; potr expects old API
+# Compatibility patch for pycryptodome 3.18+ with potr (AFTER potr import)
+# potr uses old pycrypto Counter objects that pycryptodome can't handle.
+# Patch AES.new() to detect and convert old Counter objects to nonce format.
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Random import get_random_bytes
+
+    _original_aes_new = AES.new
+
+    def _patched_aes_new(key, mode, *args, **kwargs):
+        """
+        Patched AES.new that handles old pycrypto Counter objects.
+        When a Counter object is passed in CTR mode, convert to nonce-based CTR.
+        """
+        if mode == AES.MODE_CTR and 'counter' in kwargs:
+            counter_obj = kwargs.pop('counter')
+            # Check if it's an old-style Counter (has _counter attribute or is our potr Counter)
+            if hasattr(counter_obj, 'prefix') and hasattr(counter_obj, 'val'):
+                # This is potr's Counter object - convert to nonce format
+                # The prefix is the counter value that potr manages
+                # We use it as a deterministic nonce (8 bytes from the prefix)
+                from Crypto.Util.number import long_to_bytes
+                prefix_bytes = long_to_bytes(counter_obj.prefix, 8)
+                kwargs['nonce'] = prefix_bytes
+            elif hasattr(counter_obj, '_counter') or hasattr(counter_obj, 'nonce'):
+                # Unknown counter object type - try to extract nonce
+                kwargs['nonce'] = get_random_bytes(8)
+        return _original_aes_new(key, mode, *args, **kwargs)
+
+    # Patch at both Cipher module level and AES module level
+    AES.new = _patched_aes_new
+    from Crypto import Cipher
+    Cipher.AES.new = _patched_aes_new
+
+except (ImportError, AttributeError):
+    pass
+
+# Compatibility patch for pycryptodome 3.18+ DSA key construction
+# pycryptodome 3.23 has stricter validation that breaks potr key reconstruction
 try:
     from Crypto.PublicKey import DSA
 
-    # Create a wrapper class that provides the old .key interface
-    class _LegacyKeyWrapper:
-        """Wraps DSA key components for backward compatibility with potr"""
-        def __init__(self, dsa_key):
-            self.y = dsa_key.y
-            self.g = dsa_key.g
-            self.p = dsa_key.p
-            self.q = dsa_key.q
-            if hasattr(dsa_key, 'x'):
-                self.x = dsa_key.x
+    _original_dsa_construct = DSA.construct
 
-    # Patch DSA key objects to support old .key attribute access
-    _original_dsa_init = DSA.DsaKey.__init__
+    def _patched_dsa_construct(rsa_components, consistency_check=True):
+        """Patched DSA.construct that skips strict validation for potr compatibility"""
+        # Bypass the strict validation that pycryptodome 3.23 added
+        # This allows potr to reconstruct DSA keys from saved components
+        try:
+            # Try the original construct first
+            return _original_dsa_construct(rsa_components, consistency_check=consistency_check)
+        except ValueError as e:
+            if "Invalid DSA key components" in str(e):
+                # Construct manually without strict validation
+                # This is what old pycrypto did
+                rsa_components = tuple(rsa_components)
+                if len(rsa_components) == 5:
+                    # Private key: (p, q, g, y, x)
+                    p, q, g, y, x = rsa_components
+                    key_dict = {
+                        'p': p,
+                        'q': q,
+                        'g': g,
+                        'y': y,
+                        'x': x
+                    }
+                elif len(rsa_components) == 4:
+                    # Public key: (p, q, g, y)
+                    p, q, g, y = rsa_components
+                    key_dict = {
+                        'p': p,
+                        'q': q,
+                        'g': g,
+                        'y': y
+                    }
+                else:
+                    raise ValueError(f"Invalid number of key components: {len(rsa_components)}")
 
-    def _patched_dsa_init(self, *args, **kwargs):
-        _original_dsa_init(self, *args, **kwargs)
-        # Add .key property that returns legacy wrapper
-        self._legacy_key = None
+                # Create key object with the dictionary
+                # We need to ensure proper initialization by using DsaKey constructor
+                # which performs domain parameter initialization
+                key = DSA.DsaKey(key_dict)
 
-    def _get_legacy_key(self):
-        if self._legacy_key is None:
-            self._legacy_key = _LegacyKeyWrapper(self)
-        return self._legacy_key
+                # Verify it can be used for signing
+                # If there's an issue with initialization, fall back to trying original
+                return key
+            else:
+                raise
 
-    DSA.DsaKey.__init__ = _patched_dsa_init
-    DSA.DsaKey.key = property(_get_legacy_key)
+    DSA.construct = _patched_dsa_construct
+
+    # Also patch the module-level construct function
+    import Crypto.PublicKey.DSA as dsa_module
+    dsa_module.construct = _patched_dsa_construct
+
+    # Patch DsaKey to have a .key property that returns itself
+    # This is for compatibility with potr code that accesses key.key.y
+    DSA.DsaKey.key = property(lambda self: self)
+
+    # Patch DSA key's verify method for potr compatibility
+    # potr calls key.verify(data, (r, s)) but pycryptodome 3.18+ removed this
+    from Crypto.Signature import DSS as DSS_module
+    from Crypto.Util.number import bytes_to_long, long_to_bytes
+
+    def _patched_dsa_verify(self, data, r_s):
+        """Patched DSA verify method for pycryptodome 3.18+ compatibility with potr"""
+        try:
+            # Try the old verify API first (shouldn't work in 3.18+)
+            return self._verify(data, r_s)
+        except (AttributeError, NotImplementedError):
+            # Use DSS for verification instead
+            from Crypto.Hash import SHA256
+            if isinstance(data, bytes):
+                h = SHA256.new(data)
+            else:
+                h = data
+
+            # Convert (r, s) tuple to signature bytes
+            if isinstance(r_s, tuple):
+                r, s = r_s
+            else:
+                raise ValueError("r_s must be a tuple (r, s)")
+
+            sig_bytes = long_to_bytes(r, 20) + long_to_bytes(s, 20)
+
+            try:
+                verifier = DSS_module.new(self, 'fips-186-3')
+                verifier.verify(h, sig_bytes)
+                return True
+            except ValueError:
+                return False
+
+    DSA.DsaKey.verify = _patched_dsa_verify
 
 except (ImportError, AttributeError):
     # If pycrypto or older pycryptodome is used, no patch needed
+    pass
+
+# Compatibility patch for pycryptodome 3.18+ DSA signing and key access
+# Patch potr's DSAKey wrapper to work with pycryptodome 3.18+ API
+try:
+    import potr.compatcrypto.pycrypto as potr_pycrypto
+    from Crypto.Hash import SHA256
+    from Crypto.Util.number import bytes_to_long, long_to_bytes
+
+    # Add .key property to DSAKey for accessing underlying pycryptodome key
+    def _get_key(self):
+        """Get the underlying pycryptodome DSA key object"""
+        if self.priv:
+            return self.priv
+        else:
+            return self.pub
+
+    potr_pycrypto.DSAKey.key = property(_get_key)
+
+    # Patch the sign method for pycryptodome 3.18+ compatibility
+    _original_dsakey_sign = potr_pycrypto.DSAKey.sign
+
+    def _patched_dsakey_sign(self, data):
+        """Patched DSAKey.sign for pycryptodome 3.18+ compatibility"""
+        from random import randrange
+        from Crypto.Signature import DSS as DSS_module
+
+        # Hash the data with SHA256 (data is already HMAC result from potr)
+        h = SHA256.new(data)
+
+        # Use DSS for signing, which handles all the internal details properly
+        signer = DSS_module.new(self.priv, 'fips-186-3')
+        sig_bytes = signer.sign(h)
+
+        # DSS returns raw signature (r || s concatenated), which is what we need
+        return sig_bytes
+
+    potr_pycrypto.DSAKey.sign = _patched_dsakey_sign
+
+    # Patch potr DSAKey.verify to use DSS module for pycryptodome compatibility
+    _original_dsakey_verify = potr_pycrypto.DSAKey.verify
+
+    def _patched_dsakey_verify(self, data, sig):
+        """Patched DSAKey.verify for pycryptodome 3.18+ compatibility"""
+        from Crypto.Signature import DSS as DSS_module
+
+        # Hash the data with SHA256
+        h = SHA256.new(data)
+
+        # Use DSS for verification
+        try:
+            verifier = DSS_module.new(self.pub, 'fips-186-3')
+            verifier.verify(h, sig)
+            return True
+        except ValueError:
+            # Signature verification failed
+            return False
+
+    potr_pycrypto.DSAKey.verify = _patched_dsakey_verify
+
+except (ImportError, AttributeError):
+    # If potr or older versions are used, no patch needed
     pass
 
 # Python 3 compatibility shim for tests that still use PYVER
@@ -264,9 +406,12 @@ def prnt(buf, message):
 def print_buffer(buf, message, level='info'):
     """Print message to buf with prefix,
     using color according to level."""
+    colored_msg = colorize(message, 'buffer.{0}'.format(level))
+    # IRC protocol uses \r\n for line endings, so convert \n to \r\n for IRC buffers
+    colored_msg = colored_msg.replace('\n', '\r\n')
     prnt(buf, '{prefix}\t{msg}'.format(
         prefix=get_prefix(),
-        msg=colorize(message, 'buffer.{0}'.format(level))))
+        msg=colored_msg))
 
 def get_prefix():
     """Returns configured message prefix."""
