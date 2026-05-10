@@ -217,6 +217,78 @@ def patched__bytes__(self):
 
 potr.proto.TaggedPlaintext.__bytes__ = patched__bytes__
 
+# Patch potr compatcrypto for PyCryptodome >= 3.x API changes.
+import potr.compatcrypto.pycrypto as _potr_pycrypto
+from numbers import Number
+
+# Patch 1: DSAKey.generate — PyCryptodome removed the .key sub-attribute
+# from DSA keys; parameters (y, g, p, q, x) are now direct attributes.
+@classmethod
+def _patched_dsa_generate(cls):
+    privkey = _potr_pycrypto.DSA.generate(1024)
+    try:
+        return cls((privkey.key.y, privkey.key.g, privkey.key.p,
+                    privkey.key.q, privkey.key.x), private=True)
+    except AttributeError:
+        return cls((privkey.y, privkey.g, privkey.p, privkey.q,
+                    privkey.x), private=True)
+
+_potr_pycrypto.DSAKey.generate = _patched_dsa_generate
+
+# Patch 2: Counter — PyCryptodome >= 3.x calls dict(counter) on AES.new()'s
+# counter parameter. Make potr's Counter iterable so dict() works.
+import potr.crypt as _potr_crypt
+import potr.utils as _potr_utils
+
+class _PatchedCounter(object):
+    """Replacement for potr's Counter that works with PyCryptodome >= 3.x."""
+    def __init__(self, prefix):
+        self.prefix = prefix
+        self.val = 0
+    def inc(self):
+        self.prefix += 1
+        self.val = 0
+    def __setattr__(self, attr, val):
+        if attr == 'prefix':
+            self.val = 0
+        super(_PatchedCounter, self).__setattr__(attr, val)
+    def byteprefix(self):
+        return _potr_utils.long_to_bytes(self.prefix, 8)
+    def __iter__(self):
+        yield ('counter_len', 8)
+        yield ('prefix', _potr_utils.long_to_bytes(self.prefix, 8))
+        yield ('suffix', b'')
+        yield ('initial_value', self.val)
+        yield ('little_endian', False)
+    def __repr__(self):
+        return '<PatchedCounter(p={p!r},v={v!r})>'.format(
+            p=self.prefix, v=self.val)
+
+_potr_pycrypto.Counter = _PatchedCounter
+_potr_crypt.Counter = _PatchedCounter
+
+# Patch 3: DSAKey.sign/verify — PyCryptodome >= 3.x removed these methods
+# in favor of Crypto.Signature.DSS (SHA1 matches old behavior for 1024-bit DSA).
+from Crypto.Hash import SHA1 as _DSA_HASH
+from Crypto.Signature import DSS as _DSS
+
+def _patched_dsa_sign(self, data):
+    h = _DSA_HASH.new(data)
+    signer = _DSS.new(self.priv, 'fips-186-3', encoding='binary')
+    return signer.sign(h)
+
+def _patched_dsa_verify(self, data, sig):
+    h = _DSA_HASH.new(data)
+    verifier = _DSS.new(self.pub, 'fips-186-3', encoding='binary')
+    try:
+        verifier.verify(h, sig)
+        return True
+    except ValueError:
+        return False
+
+_potr_pycrypto.DSAKey.sign = _patched_dsa_sign
+_potr_pycrypto.DSAKey.verify = _patched_dsa_verify
+
 def command(buf, command_str):
     """Wrap weechat.command() with utf-8 encode."""
     debug(command_str)
@@ -605,6 +677,7 @@ class IrcContext(potr.context.Context):
         self.in_otr_message = False
         self.in_smp = False
         self.smp_question = False
+        self.previous_log_level = None
 
     def policy_config_option(self, policy):
         """Get the option name of a policy option for this context."""
@@ -918,7 +991,7 @@ Note: You can safely omit specifying the peer and server when
         to 0. If it was already 0, return None."""
         # If previous_log_level has not been previously set, return the level
         # we detect now.
-        if not hasattr(self, 'previous_log_level'):
+        if self.previous_log_level is None:
             previous_log_level = self.get_log_level()
 
             if self.is_logged():
@@ -954,7 +1027,7 @@ Note: You can safely omit specifying the peer and server when
             weechat.command(buf, '/mute unset {0}'.format(
                 logger_option_name))
 
-        del self.previous_log_level
+        self.previous_log_level = None
 
     def msg_convert_in(self, msg):
         """Transform incoming OTR message to IRC format.
@@ -1058,6 +1131,11 @@ class IrcOtrAccount(potr.context.Account):
 
                 if os.path.exists(default_key_path):
                     shutil.copyfile(default_key_path, self.key_file_path)
+                    prnt('', '\tWARNING: account {name} is using the private key from '
+                         '{default}. Shared keys undermine OTR identity '
+                         'separation -- each account should have its own '
+                         'unique key.'.format(
+                             name=self.name, default=default_key))
                     return read_private_key(self.key_file_path)
 
     def savePrivkey(self):
@@ -1179,8 +1257,11 @@ def message_in_cb(data, modifier, modifier_data, string):
     """Incoming message callback"""
     debug(('message_in_cb', data, modifier, modifier_data, string))
 
-    parsed = parse_irc_privmsg(
-        PYVER.to_unicode(string), PYVER.to_unicode(modifier_data))
+    try:
+        parsed = parse_irc_privmsg(
+            PYVER.to_unicode(string), PYVER.to_unicode(modifier_data))
+    except (PrivmsgParseException, KeyError, ValueError):
+        return string
     debug(('parsed message', parsed))
 
     # skip processing messages to public channels
